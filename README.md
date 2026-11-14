@@ -36,6 +36,87 @@
 | `GET /stations/{station_id}/dates/{data_date}/versions/{version}/file` | 下载指定版本留存的原始 CSV（字节一致） |
 | `GET /health` | 健康检查 |
 
+### 缺报覆盖报告（月度交付前核对）
+
+数据员在交付月度 PM2.5 数据前，提交日期范围和各站的**启用**、**批准停报**区间，
+先得到缺报预览，确认后再保存报告。所有区间**起止日均包含**。
+
+#### 预览
+
+`POST /coverage-reports/preview`
+
+```json
+{
+  "start_date": "2026-11-01",
+  "end_date": "2026-11-30",
+  "stations": [
+    {
+      "station_id": "ST-001",
+      "enabled_intervals": [["2026-11-01", "2026-11-30"]],
+      "suspended_intervals": [["2026-11-03", "2026-11-05"]]
+    },
+    {
+      "station_id": "ST-002",
+      "enabled_intervals": [["2026-11-10", "2026-11-20"]]
+    }
+  ]
+}
+```
+
+- 日期范围最多 **31 天**（含起止日）；也可用 `"month": "2026-11"`。
+- 区间写法兼容二维数组、`{"start_date","end_date"}` 对象、
+  `"2026-11-03至2026-11-05"` / `".."` 字符串等；
+- `enabled_intervals` 可省略（默认整段范围启用）；显式空数组表示不启用；
+- 缺报日 = `启用日 − 停报日`，未发布（无当前版本）的启用日即为缺报；
+- 已发布日期附 `version`（当前版本）与 `file_id`（当前版本文件标识）。
+
+响应（节选）：
+
+```json
+{
+  "status": "preview",
+  "preview_id": "…",
+  "preview_token": "…",
+  "start_date": "2026-11-01",
+  "end_date": "2026-11-30",
+  "missing_count": 2,
+  "published_count": 1,
+  "missing": [
+    {"station_id": "ST-001", "data_date": "2026-11-01", "status": "missing"}
+  ],
+  "published": [
+    {"station_id": "ST-001", "data_date": "2026-11-02",
+     "version": 1, "file_id": "…"}
+  ],
+  "stations": [{"station_id": "ST-001", "required_days": ["…"],
+                "missing_count": 2, "published_count": 1}],
+  "arrangement": {"start_date": "…", "end_date": "…", "stations": ["…"]}
+}
+```
+
+#### 确认与重查
+
+| 接口 | 用途 |
+|---|---|
+| `POST /coverage-reports` | 确认预览并保存报告（也可传 `arrangement` 直接确认） |
+| `GET /coverage-reports/{report_id}` | 按 ID 重查已保存的安排与结果（结果不随后续补报改变） |
+| `GET /coverage-reports` | 列出已确认报告摘要 |
+
+确认时携带预览返回的 `preview_id` 或 `preview_token`：
+
+```json
+{"preview_id": "…"}
+```
+
+- 保存内容包含本次所用**规范化安排**、**预览时的发布快照**和**计算结果**；
+- 若预览后相关站点日发生补报/首次发布，确认返回
+  `409 coverage_conflict`，`changed_station_days` 列出变化的站点日，且**不保存任何报告**；
+- 与本次缺报无关的站点日（范围外、停报日、未启用日）的补报**不影响确认**；
+- 确认和补报都通过 SQLite `BEGIN IMMEDIATE` 串行化，按提交顺序判定：
+  先确认则报告保留，先补报则旧确认冲突；
+- 已确认报告保存的是确认时刻的结果，后续补报不会改变它；
+- 需重新预览后才能再次确认。
+
 ### 失败安全保证
 
 - 原始 CSV 先写入临时文件，再 `os.replace` 原子落到**不可变路径**
@@ -49,9 +130,10 @@
 app/
   config.py       # 数据目录配置（环境变量 PM25_DATA_DIR）
   validation.py   # CSV 解析与整批校验（错误行/缺失小时/原因）
-  db.py           # SQLite 模式、乐观版本控制、事务与文件原子落盘
+  coverage.py     # 覆盖报告安排校验、启用/停报区间合成与缺报计算
+  db.py           # SQLite 模式、乐观版本控制、事务、文件原子落盘与报告持久化
   main.py         # FastAPI 路由与错误处理
-tests/            # 35 个 pytest 用例（校验/API/并发/故障恢复）
+tests/            # 50 个 pytest 用例（校验/API/并发/故障恢复/覆盖报告）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -91,6 +173,26 @@ curl -X POST http://localhost:8000/stations/ST-001/dates/2026-11-14/uploads \
 
 # 下载历史版本原始 CSV
 curl -OJ http://localhost:8000/stations/ST-001/dates/2026-11-14/versions/1/file
+
+# 缺报覆盖报告：预览
+curl -X POST http://localhost:8000/coverage-reports/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_date": "2026-11-01", "end_date": "2026-11-30",
+    "stations": [{
+      "station_id": "ST-001",
+      "enabled_intervals": [["2026-11-01", "2026-11-30"]],
+      "suspended_intervals": [["2026-11-03", "2026-11-05"]]
+    }]
+  }'
+
+# 确认预览并保存报告
+curl -X POST http://localhost:8000/coverage-reports \
+  -H 'Content-Type: application/json' \
+  -d '{"preview_id": "<preview_id>"}'
+
+# 按报告 ID 重查
+curl http://localhost:8000/coverage-reports/<report_id>
 ```
 
 ## 校验失败响应示例
